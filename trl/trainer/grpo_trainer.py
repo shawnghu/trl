@@ -2165,8 +2165,7 @@ class GRPOTrainer(_BaseTrainer):
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
-        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
-        return loss / normalizer
+        return loss
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -2382,24 +2381,19 @@ class GRPOTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
         if self.loss_type in ["grpo", "sapo"]:
             loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
-            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
-            loss = loss / normalizer
         elif self.loss_type == "bnpo":
             loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
-            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
-            loss = loss / normalizer
         elif self.loss_type == "dr_grpo":
             loss = (per_token_loss * mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
-            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
-            loss = loss / normalizer
         elif self.loss_type in ["cispo", "dapo", "vespo"]:
             normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
             loss = (per_token_loss * mask).sum() / normalizer
+            # Compensate for accelerator.backward() dividing by gradient_accumulation_steps,
+            # which is unwanted here since num_items_in_batch already spans the full accumulated batch.
+            loss = loss * self.accelerator.gradient_accumulation_steps
         elif self.loss_type == "luspo":
             # Unless importance_sampling_level="token" (not recommended here), per_token_loss is expected to be (B, 1)
             loss = (per_token_loss * mask.sum(1, keepdim=True)).mean()
-            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
-            loss = loss / normalizer
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
